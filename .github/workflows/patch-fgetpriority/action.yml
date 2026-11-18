@@ -9,9 +9,18 @@ runs:
         run: |
           cd $GITHUB_WORKSPACE/device_kernel/
 
+          # 判断方向必须正确：内核里没有 fgetpriority 才动手。
+          # 原实现两个分支的语义是反的——drivers/Kconfig 里没有 fgetpriority
+          # 反而走 else，打印“已内置，跳过”，于是从来没有 clone 和注入过。
           if grep -q "fgetpriority" "drivers/Kconfig"; then
 
+            echo "[=] Kernel already has fgetpriority, skipped."
+
+          else
+
             git clone https://github.com/aerath-stuff/fgetpriority.git fgetpriority
+            # 软链指向仓库根：drivers/fgetpriority/kernel/{Kconfig,Makefile} 才解析得到；
+            # 指向 kernel/ 会让路径变成 .../kernel/kernel。
             ln -sfn ../fgetpriority drivers/fgetpriority
             grep -q "fgetpriority" drivers/Makefile || echo 'obj-$(CONFIG_FGETPRIORITY) += fgetpriority/kernel/' >> drivers/Makefile
             grep -q "drivers/fgetpriority/Kconfig" drivers/Kconfig || sed -i '/endmenu/i source "drivers/fgetpriority/kernel/Kconfig"' drivers/Kconfig
@@ -19,7 +28,4 @@ runs:
             echo "CONFIG_FGETPRIORITY=y" >> ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
 
             echo "[+] Patched fgetpriority for your kernel successfully."
-          else
-
-            echo "[-] Kernel has been embedded in fgetpriority, Skipped."
           fi
