@@ -126,6 +126,9 @@ jobs:
           # 按上游 #3981 的形状给 setprocattr 加 live-policy 快速拒绝：
           # 未知 type 只付一次查表，与 stock 一致。
           python3 "$GITHUB_WORKSPACE/.github/scripts/patch_ksu_setprocattr.py" "$GITHUB_WORKSPACE/device_kernel"
+          # 4.9 的 shmem 缺 F_SEAL_FUTURE_WRITE，ART 就退回 ashmem 建 zygote JIT 区。
+          # 补上之后 ART 走 memfd("jit-zygote-cache")，与 stock 行为一致。
+          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_future_write_seal.py" "$GITHUB_WORKSPACE/device_kernel"
 
       - name: 🧰 Patch Kernel of Re:Kernel
         uses: ./.github/workflows/patch-rekernel
