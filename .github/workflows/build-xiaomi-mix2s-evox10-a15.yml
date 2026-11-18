@@ -66,7 +66,7 @@ env:
   REKERNEL_ENABLE: "true" # if u need Re:Kernel.
   DROIDSPACES_ENABLE: "true" # if u need Droidspaces or LXC/Docker.
   NOMOUNT_ENABLE: "false" # if u need NoMount.
-  FGETPRIORITY_ENABLE: "false" #if u need hide getpriority.
+  FGETPRIORITY_ENABLE: "true" #if u need hide getpriority.
   VPNHIDE_ENABLE: "false" #if u need hide vpn status.
 
   HOOK_METHOD: "syscall" # Manual hook method ->  syscall.
@@ -123,7 +123,9 @@ jobs:
           # Only ${{ env.DEVICE_NAME }} use it.
           cd $GITHUB_WORKSPACE/device_kernel
 
-          # Nothing
+          # 按上游 #3981 的形状给 setprocattr 加 live-policy 快速拒绝：
+          # 未知 type 只付一次查表，与 stock 一致。
+          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_ksu_setprocattr.py" "$GITHUB_WORKSPACE/device_kernel"
 
       - name: 🧰 Patch Kernel of Re:Kernel
         uses: ./.github/workflows/patch-rekernel
