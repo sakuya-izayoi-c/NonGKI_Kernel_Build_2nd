@@ -55,13 +55,14 @@ index 3d83ed975..d03f699f2 100644
  	help
  	  Make tombstone users get a better experience.
 diff --git a/drivers/net/rekernel/rekernel.c b/drivers/net/rekernel/rekernel.c
-index 142bafb16..9089f26db 100644
+index 142bafb16..56f991752 100644
 --- a/drivers/net/rekernel/rekernel.c
 +++ b/drivers/net/rekernel/rekernel.c
-@@ -1,12 +1,15 @@
+@@ -1,12 +1,16 @@
  #include <linux/init.h>
 +#include <linux/kfifo.h>
 +#include <linux/proc_fs.h>
++#include <linux/security.h>
 +#include <linux/seq_file.h>
  #include <linux/types.h>
 +#include <linux/workqueue.h>
@@ -75,7 +76,7 @@ index 142bafb16..9089f26db 100644
  #include <net/ip.h>
  #include <net/ipv6.h>
  #include <net/tcp.h>
-@@ -19,92 +22,143 @@ static const char *binder_type[] = {
+@@ -19,92 +23,169 @@ static const char *binder_type[] = {
  	"free_buffer_full",
  };
 
@@ -113,15 +114,41 @@ index 142bafb16..9089f26db 100644
 -		return 0;
 +	/* Keep legacy control writes harmless; discovery is read-only. */
 +}
++
++static bool rekernel_authorize_listener(struct net *net)
++{
++	static const char system_server[] = "u:r:system_server:s0";
++	kuid_t uid = current_euid();
++	char *context;
++	u32 sid, len;
++	bool allowed;
++
++	if (net != &init_net)
++		return false;
++	if (uid_eq(uid, GLOBAL_ROOT_UID))
++		return true;
++	/* NoActive's listener runs in Android's system_server, not as root. */
++	if (!uid_eq(uid, KUIDT_INIT(1000)))
++		return false;
++
++	security_task_getsecid(current, &sid);
++	if (security_secid_to_secctx(sid, &context, &len))
++		return false;
++	allowed = len == sizeof(system_server) &&
++		  !memcmp(context, system_server, sizeof(system_server));
++	security_release_secctx(context, len);
++	return allowed;
++}
++
++static struct netlink_kernel_cfg rekernel_cfg = {
++	.flags = NL_CFG_F_PRIVATE,
++	.input = rekernel_discard_message,
++	.authorize_listener = rekernel_authorize_listener,
++};
 
 -	for (netlink_unit = NETLINK_REKERNEL_MIN; netlink_unit < NETLINK_REKERNEL_MAX; netlink_unit++) {
 -		netlink_socket = netlink_kernel_create(&init_net, netlink_unit, &rekernel_cfg);
 -		if (netlink_socket != NULL)
-+static struct netlink_kernel_cfg rekernel_cfg = {
-+	.flags = NL_CFG_F_ROOT_ONLY,
-+	.input = rekernel_discard_message,
-+};
-+
 +static int __init start_rekernel_server(void)
 +{
 +	struct proc_dir_entry *dir;
@@ -270,7 +297,7 @@ index 142bafb16..9089f26db 100644
  		snprintf(binder_kmsg, sizeof(binder_kmsg), "type=Binder,bindertype=%s,oneway=%d,from_pid=%d,from=%d,target_pid=%d,target=%d,rpc_name=%s,code=%d;", binder_type[type], oneway, src_pid, task_uid(src).val, dst_pid, task_uid(dst).val, rpc_name, code);
  		break;
  	case SIGNAL:
-@@ -113,15 +167,7 @@ void rekernel_report(int reporttype, int type, pid_t src_pid, struct task_struct
+@@ -113,15 +194,7 @@ void rekernel_report(int reporttype, int type, pid_t src_pid, struct task_struct
  	default:
  		return;
  	}
@@ -287,7 +314,7 @@ index 142bafb16..9089f26db 100644
  }
 
  static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket_buffer,
-@@ -160,12 +206,13 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
+@@ -160,12 +233,13 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
  	if (sk == NULL || !sk_fullsock(sk))
  		return NF_ACCEPT;
 
@@ -303,7 +330,7 @@ index 142bafb16..9089f26db 100644
  		if (ip_hdr(socket_buffer)->version == 4) {
  			snprintf(binder_kmsg, sizeof(binder_kmsg), "type=Network,target=%d,proto=ipv4;", uid);
  #if IS_ENABLED(CONFIG_IPV6)
-@@ -175,9 +222,9 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
+@@ -175,9 +249,9 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
  		} else {
  			return NF_ACCEPT;
  		}
@@ -315,24 +342,27 @@ index 142bafb16..9089f26db 100644
  	return NF_ACCEPT;
  }
 
-@@ -199,54 +246,21 @@ static struct nf_hook_ops rekernel_nf_ops[] = {
+@@ -199,54 +273,21 @@ static struct nf_hook_ops rekernel_nf_ops[] = {
  #endif
  };
 
 -void unregister_netfilter(void)
--{
++static int __init rekernel_init(void)
+ {
 -	struct net *net;
--
++	int ret = start_rekernel_server();
+
 -	rtnl_lock();
 -	for_each_net(net) {
 -		nf_unregister_net_hooks(net, rekernel_nf_ops, ARRAY_SIZE(rekernel_nf_ops));
 -	}
 -	rtnl_unlock();
 -}
--
++	if (ret)
++		return ret;
+
 -int register_netfilter(void)
-+static int __init rekernel_init(void)
- {
+-{
 -	int rc = LINE_SUCCESS;
 -	struct net *net = NULL;
 -
@@ -350,13 +380,10 @@ index 142bafb16..9089f26db 100644
 -		unregister_netfilter();
 -		return LINE_ERROR;
 -	}
-+	int ret = start_rekernel_server();
-
+-
 -	return LINE_SUCCESS;
 -}
-+	if (ret)
-+		return ret;
-
+-
 -int __init rekernel_init(void)
 -{
 -	start_rekernel_server();
@@ -380,18 +407,27 @@ index 142bafb16..9089f26db 100644
  MODULE_LICENSE("GPL");
  MODULE_AUTHOR("Nep-Timeline & AlexLiuDev233");
 diff --git a/include/linux/netlink.h b/include/linux/netlink.h
-index da14ab61f..603ffc5cc 100644
+index da14ab61f..9714ee049 100644
 --- a/include/linux/netlink.h
 +++ b/include/linux/netlink.h
 @@ -41,6 +41,8 @@ extern void netlink_table_ungrab(void);
 
  #define NL_CFG_F_NONROOT_RECV	(1 << 0)
  #define NL_CFG_F_NONROOT_SEND	(1 << 1)
-+/* Exclusive protocol, available only to system-root userspace sockets. */
-+#define NL_CFG_F_ROOT_ONLY	(1 << 2)
++/* Exclusive protocol with an explicit userspace socket authorization hook. */
++#define NL_CFG_F_PRIVATE	(1 << 2)
 
  /* optional Netlink kernel configuration parameters */
  struct netlink_kernel_cfg {
+@@ -51,6 +53,8 @@ struct netlink_kernel_cfg {
+ 	int		(*bind)(struct net *net, int group);
+ 	void		(*unbind)(struct net *net, int group);
+ 	bool		(*compare)(struct net *net, struct sock *sk);
++	/* Runs in socket-creation context without the table lock. */
++	bool		(*authorize_listener)(struct net *net);
+ };
+
+ extern struct sock *__netlink_kernel_create(struct net *net, int unit,
 diff --git a/include/net/rekernel.h b/include/net/rekernel.h
 index 942d4cb15..843885d0f 100644
 --- a/include/net/rekernel.h
@@ -431,7 +467,7 @@ index ff8ba82c9..6ca112409 100644
  ret:
  	trace_signal_generate(sig, info, t, group, result);
 diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
-index 47b1631bf..6782a901c 100644
+index 47b1631bf..a24c39169 100644
 --- a/net/netlink/af_netlink.c
 +++ b/net/netlink/af_netlink.c
 @@ -547,6 +547,11 @@ static int netlink_insert(struct sock *sk, u32 portid)
@@ -439,34 +475,66 @@ index 47b1631bf..6782a901c 100644
  	int err;
 
 +	/* Cover both explicit bind and implicit port allocation. */
-+	if (portid && (READ_ONCE(table->flags) & NL_CFG_F_ROOT_ONLY) &&
-+	    !uid_eq(sock_i_uid(sk), GLOBAL_ROOT_UID))
++	if (portid && (READ_ONCE(table->flags) & NL_CFG_F_PRIVATE) &&
++	    !nlk_sk(sk)->authorized_user)
 +		return -EPERM;
 +
  	lock_sock(sk);
 
  	err = nlk_sk(sk)->portid == portid ? 0 : -EBUSY;
-@@ -672,8 +677,11 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
- 		netlink_lock_table();
- 	}
- #endif
--	if (nl_table[protocol].registered &&
--	    try_module_get(nl_table[protocol].module))
-+	if (!kern && (nl_table[protocol].flags & NL_CFG_F_ROOT_ONLY) &&
-+	    !uid_eq(current_euid(), GLOBAL_ROOT_UID))
+@@ -653,6 +658,8 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
+ 	struct netlink_sock *nlk;
+ 	int (*bind)(struct net *net, int group);
+ 	void (*unbind)(struct net *net, int group);
++	bool (*authorize_listener)(struct net *net);
++	bool private;
+ 	int err = 0;
+
+ 	sock->state = SS_UNCONNECTED;
+@@ -680,11 +687,19 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
+ 	cb_mutex = nl_table[protocol].cb_mutex;
+ 	bind = nl_table[protocol].bind;
+ 	unbind = nl_table[protocol].unbind;
++	private = !kern && (nl_table[protocol].flags & NL_CFG_F_PRIVATE);
++	authorize_listener = nl_table[protocol].authorize_listener;
+ 	netlink_unlock_table();
+
+ 	if (err < 0)
+ 		goto out;
+
++	/* The callback can query LSM state; do not hold the table lock. */
++	if (private && (!authorize_listener || !authorize_listener(net))) {
 +		err = -EPERM;
-+	else if (nl_table[protocol].registered &&
-+		 try_module_get(nl_table[protocol].module))
- 		module = nl_table[protocol].module;
- 	else
- 		err = -EPROTONOSUPPORT;
-@@ -1320,6 +1328,13 @@ int netlink_unicast(struct sock *ssk, struct sk_buff *skb,
++		goto out_module;
++	}
++
+ 	err = __netlink_create(net, sock, cb_mutex, protocol, kern);
+ 	if (err < 0)
+ 		goto out_module;
+@@ -697,6 +712,8 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
+ 	nlk->module = module;
+ 	nlk->netlink_bind = bind;
+ 	nlk->netlink_unbind = unbind;
++	/* Published with the socket and never changed by bind or setsockopt. */
++	nlk->authorized_user = private;
+ out:
+ 	return err;
+
+@@ -782,6 +799,7 @@ static int netlink_release(struct socket *sock)
+ 			nl_table[sk->sk_protocol].module = NULL;
+ 			nl_table[sk->sk_protocol].bind = NULL;
+ 			nl_table[sk->sk_protocol].unbind = NULL;
++			nl_table[sk->sk_protocol].authorize_listener = NULL;
+ 			nl_table[sk->sk_protocol].flags = 0;
+ 			nl_table[sk->sk_protocol].registered = 0;
+ 		}
+@@ -1320,6 +1338,13 @@ int netlink_unicast(struct sock *ssk, struct sk_buff *skb,
  	if (netlink_is_kernel(sk))
  		return netlink_unicast_kernel(sk, skb, ssk);
 
 +	/* Check the held destination, not a separate racy port-ID lookup. */
-+	if ((READ_ONCE(nl_table[ssk->sk_protocol].flags) & NL_CFG_F_ROOT_ONLY) &&
-+	    !uid_eq(sock_i_uid(sk), GLOBAL_ROOT_UID)) {
++	if ((READ_ONCE(nl_table[ssk->sk_protocol].flags) & NL_CFG_F_PRIVATE) &&
++	    !nlk_sk(sk)->authorized_user) {
 +		kfree_skb(skb);
 +		sock_put(sk);
 +		return -EPERM;
@@ -474,7 +542,7 @@ index 47b1631bf..6782a901c 100644
  	if (sk_filter(sk, skb)) {
  		err = skb->len;
  		kfree_skb(skb);
-@@ -2019,9 +2034,17 @@ __netlink_kernel_create(struct net *net, int unit, struct module *module,
+@@ -2019,9 +2044,17 @@ __netlink_kernel_create(struct net *net, int unit, struct module *module,
  		goto out_sock_release;
 
  	nlk = nlk_sk(sk);
@@ -486,7 +554,7 @@ index 47b1631bf..6782a901c 100644
 +	 */
 +	if (nl_table[unit].registered &&
 +	    ((nl_table[unit].flags | (cfg ? cfg->flags : 0)) &
-+	     NL_CFG_F_ROOT_ONLY)) {
++	     NL_CFG_F_PRIVATE)) {
 +		netlink_table_ungrab();
 +		goto out_sock_release;
 +	}
@@ -494,3 +562,31 @@ index 47b1631bf..6782a901c 100644
  	if (!nl_table[unit].registered) {
  		nl_table[unit].groups = groups;
  		rcu_assign_pointer(nl_table[unit].listeners, listeners);
+@@ -2030,6 +2063,7 @@ __netlink_kernel_create(struct net *net, int unit, struct module *module,
+ 		if (cfg) {
+ 			nl_table[unit].bind = cfg->bind;
+ 			nl_table[unit].unbind = cfg->unbind;
++			nl_table[unit].authorize_listener = cfg->authorize_listener;
+ 			nl_table[unit].flags = cfg->flags;
+ 			if (cfg->compare)
+ 				nl_table[unit].compare = cfg->compare;
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index bae961cfa..26ef1c2c9 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -23,6 +23,7 @@ struct netlink_sock {
+ 	size_t			max_recvmsg_len;
+ 	wait_queue_head_t	wait;
+ 	bool			bound;
++	bool			authorized_user;
+ 	bool			cb_running;
+ 	int			dump_done_errno;
+ 	struct netlink_callback	cb;
+@@ -54,6 +55,7 @@ struct netlink_table {
+ 	int			(*bind)(struct net *net, int group);
+ 	void			(*unbind)(struct net *net, int group);
+ 	bool			(*compare)(struct net *net, struct sock *sock);
++	bool			(*authorize_listener)(struct net *net);
+ 	int			registered;
+ };
+
