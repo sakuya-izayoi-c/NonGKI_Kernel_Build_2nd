@@ -1,21 +1,38 @@
 name: 'Patch ReKernel for Kernel.'
 
+inputs:
+  device-patch:
+    description: 'Optional device-specific Re:Kernel overlay patch.'
+    default: ''
+
 runs:
   using: 'composite'
   steps:
       - name: Patch ReKernel
         if: env.REKERNEL_ENABLE == 'true'
         shell: bash
+        env:
+          REKERNEL_DEVICE_PATCH: ${{ inputs.device-patch }}
         run: |
-          cd $GITHUB_WORKSPACE/device_kernel/
+          cd "$GITHUB_WORKSPACE/device_kernel"
 
           if grep -q "cgroup_task_frozen" "kernel/cgroup.c" || grep -q "cgroup_task_frozen" "kernel/cgroup/cgroup.c"; then
 
-            cp /tmp/Patches/Rekernel/rekernel_patches.sh ./
-            bash rekernel_patches.sh
+            bash /tmp/Patches/Rekernel/rekernel_patches.sh
 
-            cp /tmp/Patches/Rekernel/rekernel_extra.patch ./
-            patch -p1 < rekernel_extra.patch || true
+            case "$REKERNEL_DEVICE_PATCH" in
+              '')
+                patch -p1 < /tmp/Patches/Rekernel/rekernel_extra.patch || true
+                ;;
+              polaris-4.9.patch)
+                git apply --whitespace=nowarn /tmp/Patches/Rekernel/rekernel_extra.patch
+                git apply /tmp/Patches/Rekernel/polaris-4.9.patch
+                ;;
+              *)
+                echo "[-] Unrecognized Re:Kernel device patch: $REKERNEL_DEVICE_PATCH" >&2
+                exit 1
+                ;;
+            esac
 
             echo "CONFIG_REKERNEL=y" >> ./arch/${{ env.KERNEL_ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
 

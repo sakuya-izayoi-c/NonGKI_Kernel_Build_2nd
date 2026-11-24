@@ -1,0 +1,496 @@
+diff --git a/drivers/android/binder.c b/drivers/android/binder.c
+index 96ebacde2..e1c771673 100644
+--- a/drivers/android/binder.c
++++ b/drivers/android/binder.c
+@@ -74,6 +74,9 @@
+ #endif
+ #include <linux/spinlock.h>
+ #include <linux/ratelimit.h>
++#ifdef CONFIG_REKERNEL
++#include <net/rekernel.h>
++#endif
+ #include "binder_alloc.h"
+ #include "binder_trace.h"
+
+@@ -3367,6 +3370,13 @@ static void binder_transaction(struct binder_proc *proc,
+ 		tr->offsets_size, extra_buffers_size,
+ 		!reply && (t->flags & TF_ONE_WAY), current->tgid);
+ 	if (IS_ERR(t->buffer)) {
++#ifdef CONFIG_REKERNEL
++		if (!reply && (t->flags & TF_ONE_WAY) &&
++		    PTR_ERR(t->buffer) == -ENOSPC)
++			rekernel_report(BINDER, OVERFLOW, task_tgid_nr(current),
++					current, target_proc->pid, target_proc->tsk,
++					true, "FREE_BUFFER_FULL", t->code);
++#endif
+ 		/*
+ 		 * -ESRCH indicates VMA cleared. The target is dying.
+ 		 */
+@@ -3639,6 +3649,13 @@ static void binder_transaction(struct binder_proc *proc,
+ 		tcomplete->type = BINDER_WORK_TRANSACTION_COMPLETE;
+ 	t->work.type = BINDER_WORK_TRANSACTION;
+
++#ifdef CONFIG_REKERNEL
++	/* Report an attempted delivery only after validating the transaction. */
++	rekernel_report(BINDER, reply ? REPLY : TRANSACTION, task_tgid_nr(current),
++			current, target_proc->pid, target_proc->tsk,
++			!reply && (t->flags & TF_ONE_WAY),
++			reply ? "SYNC_BINDER_REPLY" : "SYNC_BINDER", t->code);
++#endif
+ 	if (reply) {
+ 		binder_enqueue_thread_work(thread, tcomplete);
+ 		binder_inner_proc_lock(target_proc);
+diff --git a/drivers/net/rekernel/Kconfig b/drivers/net/rekernel/Kconfig
+index 3d83ed975..d03f699f2 100644
+--- a/drivers/net/rekernel/Kconfig
++++ b/drivers/net/rekernel/Kconfig
+@@ -1,7 +1,8 @@
+ menu "Re:Kernel"
+
+ config REKERNEL
+-	tristate "Re:Kernel support"
++	bool "Re:Kernel support"
++	depends on CGROUPS && PROC_FS && NETFILTER
+ 	default y
+ 	help
+ 	  Make tombstone users get a better experience.
+diff --git a/drivers/net/rekernel/rekernel.c b/drivers/net/rekernel/rekernel.c
+index 142bafb16..9089f26db 100644
+--- a/drivers/net/rekernel/rekernel.c
++++ b/drivers/net/rekernel/rekernel.c
+@@ -1,12 +1,15 @@
+ #include <linux/init.h>
++#include <linux/kfifo.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
+ #include <linux/types.h>
++#include <linux/workqueue.h>
+ #include <net/sock.h>
+ #include <linux/netlink.h>
+
+ #include <linux/netfilter.h>
+ #include <linux/netfilter_ipv4.h>
+ #include <linux/netfilter_ipv6.h>
+-#include <net/rtnetlink.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+ #include <net/tcp.h>
+@@ -19,92 +22,143 @@ static const char *binder_type[] = {
+ 	"free_buffer_full",
+ };
+
+-static int netlink_unit = NETLINK_REKERNEL_MIN;
++static int netlink_unit;
++static struct sock *netlink_socket;
+
+-static void netlink_rcv_msg(struct sk_buff* socket_buffer) {
+-	/* DO NOTHING */
++static int rekernel_unit_show(struct seq_file *m, void *unused)
++{
++	seq_printf(m, "%d\n", netlink_unit);
++	return 0;
+ }
+-static struct sock* netlink_socket = NULL;
+-static struct netlink_kernel_cfg rekernel_cfg = {
+-	.input = netlink_rcv_msg, // set recv callback
++
++static int rekernel_unit_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, rekernel_unit_show, NULL);
++}
++
++static const struct file_operations rekernel_unit_fops = {
++	.open = rekernel_unit_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
+ };
+-static int start_rekernel_server(void)
++
++static void rekernel_discard_message(struct sk_buff *skb)
+ {
+-	if (netlink_socket)
+-		return 0;
++	/* Keep legacy control writes harmless; discovery is read-only. */
++}
+
+-	for (netlink_unit = NETLINK_REKERNEL_MIN; netlink_unit < NETLINK_REKERNEL_MAX; netlink_unit++) {
+-		netlink_socket = netlink_kernel_create(&init_net, netlink_unit, &rekernel_cfg);
+-		if (netlink_socket != NULL)
++static struct netlink_kernel_cfg rekernel_cfg = {
++	.flags = NL_CFG_F_ROOT_ONLY,
++	.input = rekernel_discard_message,
++};
++
++static int __init start_rekernel_server(void)
++{
++	struct proc_dir_entry *dir;
++	struct sock *sk = NULL;
++	char unit_name[12];
++	int unit;
++
++	for (unit = NETLINK_REKERNEL_MIN; unit < NETLINK_REKERNEL_MAX; unit++) {
++		/* Do not steal Qualcomm SOCKEV's unit before its initcall. */
++		if (IS_ENABLED(CONFIG_SOCKEV_NLMCAST) && unit == NETLINK_SOCKEV)
++			continue;
++		sk = netlink_kernel_create(&init_net, unit, &rekernel_cfg);
++		if (sk)
+ 			break;
+ 	}
+-	if (netlink_socket == NULL) {
+-		pr_err("Failed to create Re:Kernel server!\n");
+-		return -1;
++	if (!sk) {
++		pr_err("Re:Kernel: no legacy Netlink unit available\n");
++		return -EADDRINUSE;
++	}
++
++	netlink_unit = unit;
++	snprintf(unit_name, sizeof(unit_name), "%d", unit);
++	dir = proc_mkdir("rekernel", NULL);
++	if (!dir || !proc_create(unit_name, 0444, dir, &rekernel_unit_fops)) {
++		if (dir)
++			proc_remove(dir);
++		netlink_kernel_release(sk);
++		pr_err("Re:Kernel: cannot publish the legacy Netlink unit\n");
++		return -ENOMEM;
+ 	}
+-	pr_info("Created Re:Kernel server! NETLINK UNIT: %d\n", netlink_unit);
++
++	smp_store_release(&netlink_socket, sk);
++	pr_info("Created Re:Kernel server! NETLINK UNIT: %d\n", unit);
+ 	return 0;
+ }
+
+-static int rekernel_send_netlink_message(char* msg, uint16_t len) {
+-	struct sk_buff* skbuffer;
+-	struct nlmsghdr* nlhdr;
++static int rekernel_send_netlink_message(const char *msg, uint16_t len)
++{
++	struct sock *sk = smp_load_acquire(&netlink_socket);
++	struct sk_buff *skbuffer;
++	struct nlmsghdr *nlhdr;
+
+-#ifdef CONFIG_REK_DEBUG
+-	pr_info("Sending Re:Kernel Netlink Message: %s", msg);// 事实证明，我们不能打印，打印就该卡成ppt了
+-#endif
++	if (!sk)
++		return -ENOTCONN;
+
+ 	skbuffer = nlmsg_new(len, GFP_ATOMIC);
+-	if (!skbuffer) {
+-#ifdef CONFIG_REK_DEBUG
+-		pr_err("netlink alloc failure.\n");
+-#endif
+-		return -1;
+-	}
++	if (!skbuffer)
++		return -ENOMEM;
+
+ 	nlhdr = nlmsg_put(skbuffer, 0, 0, netlink_unit, len, 0);
+ 	if (!nlhdr) {
+-#ifdef CONFIG_REK_DEBUG
+-		pr_err("nlmsg_put failaure.\n");
+-#endif
+ 		nlmsg_free(skbuffer);
+-		return -1;
++		return -EMSGSIZE;
+ 	}
+
+ 	memcpy(nlmsg_data(nlhdr), msg, len);
+-	return netlink_unicast(netlink_socket, skbuffer, USER_PORT, MSG_DONTWAIT);
++	return netlink_unicast(sk, skbuffer, USER_PORT, MSG_DONTWAIT);
+ }
+
+-void rekernel_report_no_binder_rpc_code(int type, pid_t src_pid, struct task_struct* src, pid_t dst_pid, struct task_struct* dst, bool oneway, char* rpc_name) {
+-	char binder_kmsg[PACKET_SIZE];
+-
+-	if (start_rekernel_server() != 0)
+-		return;
++#define REKERNEL_QUEUE_DEPTH 64
++struct rekernel_event {
++	u16 len;
++	char data[PACKET_SIZE];
++};
++static DEFINE_KFIFO(rekernel_events, struct rekernel_event, REKERNEL_QUEUE_DEPTH);
++static DEFINE_SPINLOCK(rekernel_events_lock);
+
+-	if (!frozen_task_group(dst))
+-		return;
++static void rekernel_flush_events(struct work_struct *work)
++{
++	struct rekernel_event event;
++	unsigned int budget = REKERNEL_QUEUE_DEPTH;
++
++	while (budget--) {
++		if (!kfifo_out_spinlocked(&rekernel_events, &event, 1,
++					  &rekernel_events_lock))
++			return;
++		rekernel_send_netlink_message(event.data, event.len);
++	}
++	/* Yield to other work under a sustained event load. */
++	schedule_work(work);
++}
++static DECLARE_WORK(rekernel_work, rekernel_flush_events);
+
+-	// if (task_uid(src).val == task_uid(dst).val)
+-	// 	return;
++static void rekernel_queue_event(const char *msg, u16 len)
++{
++	struct rekernel_event event = { .len = len };
+
+-	snprintf(binder_kmsg, sizeof(binder_kmsg), "type=Binder,bindertype=%s,oneway=%d,from_pid=%d,from=%d,target_pid=%d,target=%d,rpc_name=%s,code=-1;", binder_type[type], oneway, src_pid, task_uid(src).val, dst_pid, task_uid(dst).val, rpc_name);
+-	rekernel_send_netlink_message(binder_kmsg, strlen(binder_kmsg));
++	if (len > sizeof(event.data))
++		return;
++	memcpy(event.data, msg, len);
++	/* Enqueue only copied values: no task or socket pointers escape a hook. */
++	if (kfifo_in_spinlocked(&rekernel_events, &event, 1, &rekernel_events_lock))
++		schedule_work(&rekernel_work);
+ }
+
+ void rekernel_report(int reporttype, int type, pid_t src_pid, struct task_struct* src, pid_t dst_pid, struct task_struct* dst, bool oneway, char* rpc_name, __u32 code) {
+ 	char binder_kmsg[PACKET_SIZE];
+
+-	if (start_rekernel_server() != 0)
++	/* Do not create sockets from Binder, signal or Netfilter context. */
++	if (!READ_ONCE(netlink_socket) || !frozen_task_group(dst))
+ 		return;
+
+-	if (!frozen_task_group(dst))
+-		return;
+-
+-	// if (task_uid(src).val == task_uid(dst).val)
+-	// 	return;
+-
+ 	switch (reporttype) {
+ 	case BINDER:
++		if ((unsigned int)type >= ARRAY_SIZE(binder_type))
++			return;
+ 		snprintf(binder_kmsg, sizeof(binder_kmsg), "type=Binder,bindertype=%s,oneway=%d,from_pid=%d,from=%d,target_pid=%d,target=%d,rpc_name=%s,code=%d;", binder_type[type], oneway, src_pid, task_uid(src).val, dst_pid, task_uid(dst).val, rpc_name, code);
+ 		break;
+ 	case SIGNAL:
+@@ -113,15 +167,7 @@ void rekernel_report(int reporttype, int type, pid_t src_pid, struct task_struct
+ 	default:
+ 		return;
+ 	}
+-	rekernel_send_netlink_message(binder_kmsg, strlen(binder_kmsg));
+-}
+-
+-static inline uid_t line_sock2uid(struct sock *sk)
+-{
+-	if (sk && sk->sk_socket)
+-		return SOCK_INODE(sk->sk_socket)->i_uid.val;
+-	else
+-		return 0;
++	rekernel_queue_event(binder_kmsg, strlen(binder_kmsg));
+ }
+
+ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket_buffer,
+@@ -160,12 +206,13 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
+ 	if (sk == NULL || !sk_fullsock(sk))
+ 		return NF_ACCEPT;
+
+-	uid = line_sock2uid(sk);
++	uid = sock_i_uid(sk).val;
+ 	if (uid < MIN_USERAPP_UID)
+ 		return NF_ACCEPT;
+
+-	if (netlink_socket != NULL) {// 如果 netlink 未开放，则不要发送netlink message 代码复制于 Rekernel LKM
++	if (READ_ONCE(netlink_socket)) {
+ 		char binder_kmsg[PACKET_SIZE];
++
+ 		if (ip_hdr(socket_buffer)->version == 4) {
+ 			snprintf(binder_kmsg, sizeof(binder_kmsg), "type=Network,target=%d,proto=ipv4;", uid);
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -175,9 +222,9 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
+ 		} else {
+ 			return NF_ACCEPT;
+ 		}
+-		rekernel_send_netlink_message(binder_kmsg, strlen(binder_kmsg));
++		rekernel_queue_event(binder_kmsg, strlen(binder_kmsg));
+ 	}
+-	
++
+ 	return NF_ACCEPT;
+ }
+
+@@ -199,54 +246,21 @@ static struct nf_hook_ops rekernel_nf_ops[] = {
+ #endif
+ };
+
+-void unregister_netfilter(void)
+-{
+-	struct net *net;
+-
+-	rtnl_lock();
+-	for_each_net(net) {
+-		nf_unregister_net_hooks(net, rekernel_nf_ops, ARRAY_SIZE(rekernel_nf_ops));
+-	}
+-	rtnl_unlock();
+-}
+-
+-int register_netfilter(void)
++static int __init rekernel_init(void)
+ {
+-	int rc = LINE_SUCCESS;
+-	struct net *net = NULL;
+-
+-	rtnl_lock();
+-	for_each_net(net) {
+-		rc = nf_register_net_hooks(net, rekernel_nf_ops, ARRAY_SIZE(rekernel_nf_ops));
+-		if (rc != LINE_SUCCESS) {
+-			pr_err("register netfilter hooks failed, rc=%d\n", rc);
+-			break;
+-		}
+-	}
+-	rtnl_unlock();
+-
+-	if (rc != LINE_SUCCESS) {
+-		unregister_netfilter();
+-		return LINE_ERROR;
+-	}
++	int ret = start_rekernel_server();
+
+-	return LINE_SUCCESS;
+-}
++	if (ret)
++		return ret;
+
+-int __init rekernel_init(void)
+-{
+-	start_rekernel_server();
+-	register_netfilter();
++	/* Match the scope of the legacy Netlink socket (init_net). */
++	ret = nf_register_net_hooks(&init_net, rekernel_nf_ops,
++				    ARRAY_SIZE(rekernel_nf_ops));
++	if (ret)
++		pr_warn("Re:Kernel: network events unavailable (%d)\n", ret);
+ 	return 0;
+ }
+-
+-void rekernel_exit(void)
+-{
+-
+-}
+-
+ module_init(rekernel_init);
+-module_exit(rekernel_exit);
+
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Nep-Timeline & AlexLiuDev233");
+diff --git a/include/linux/netlink.h b/include/linux/netlink.h
+index da14ab61f..603ffc5cc 100644
+--- a/include/linux/netlink.h
++++ b/include/linux/netlink.h
+@@ -41,6 +41,8 @@ extern void netlink_table_ungrab(void);
+
+ #define NL_CFG_F_NONROOT_RECV	(1 << 0)
+ #define NL_CFG_F_NONROOT_SEND	(1 << 1)
++/* Exclusive protocol, available only to system-root userspace sockets. */
++#define NL_CFG_F_ROOT_ONLY	(1 << 2)
+
+ /* optional Netlink kernel configuration parameters */
+ struct netlink_kernel_cfg {
+diff --git a/include/net/rekernel.h b/include/net/rekernel.h
+index 942d4cb15..843885d0f 100644
+--- a/include/net/rekernel.h
++++ b/include/net/rekernel.h
+@@ -28,7 +28,6 @@ static inline bool frozen_task_group(struct task_struct* task) {
+     return (cgroup_task_frozen(task) || cgroup_freezing(task));
+ }
+
+-extern void rekernel_report_no_binder_rpc_code(int type, pid_t src_pid, struct task_struct* src, pid_t dst_pid, struct task_struct* dst, bool oneway, char* rpc_name);
+ extern void rekernel_report(int reporttype, int type, pid_t src_pid, struct task_struct* src, pid_t dst_pid, struct task_struct* dst, bool oneway, char* rpc_name, __u32 code);
+
+ #endif /* __UAPI_LINUX_RE_KERNEL_H */
+diff --git a/kernel/signal.c b/kernel/signal.c
+index ff8ba82c9..6ca112409 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -39,6 +39,9 @@
+ #include <linux/oom.h>
+ #include <linux/capability.h>
+ #include <linux/cgroup.h>
++#ifdef CONFIG_REKERNEL
++#include <net/rekernel.h>
++#endif
+
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/signal.h>
+@@ -1139,6 +1142,11 @@ static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
+ out_set:
+ 	signalfd_notify(t, sig);
+ 	sigaddset(&pending->signal, sig);
++#ifdef CONFIG_REKERNEL
++	if (sig == SIGKILL || sig == SIGTERM || sig == SIGABRT || sig == SIGQUIT)
++		rekernel_report(SIGNAL, sig, task_tgid_nr(current), current,
++				task_tgid_nr(t), t, false, NULL, 0);
++#endif
+ 	complete_signal(sig, t, group);
+ ret:
+ 	trace_signal_generate(sig, info, t, group, result);
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 47b1631bf..6782a901c 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -547,6 +547,11 @@ static int netlink_insert(struct sock *sk, u32 portid)
+ 	struct netlink_table *table = &nl_table[sk->sk_protocol];
+ 	int err;
+
++	/* Cover both explicit bind and implicit port allocation. */
++	if (portid && (READ_ONCE(table->flags) & NL_CFG_F_ROOT_ONLY) &&
++	    !uid_eq(sock_i_uid(sk), GLOBAL_ROOT_UID))
++		return -EPERM;
++
+ 	lock_sock(sk);
+
+ 	err = nlk_sk(sk)->portid == portid ? 0 : -EBUSY;
+@@ -672,8 +677,11 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
+ 		netlink_lock_table();
+ 	}
+ #endif
+-	if (nl_table[protocol].registered &&
+-	    try_module_get(nl_table[protocol].module))
++	if (!kern && (nl_table[protocol].flags & NL_CFG_F_ROOT_ONLY) &&
++	    !uid_eq(current_euid(), GLOBAL_ROOT_UID))
++		err = -EPERM;
++	else if (nl_table[protocol].registered &&
++		 try_module_get(nl_table[protocol].module))
+ 		module = nl_table[protocol].module;
+ 	else
+ 		err = -EPROTONOSUPPORT;
+@@ -1320,6 +1328,13 @@ int netlink_unicast(struct sock *ssk, struct sk_buff *skb,
+ 	if (netlink_is_kernel(sk))
+ 		return netlink_unicast_kernel(sk, skb, ssk);
+
++	/* Check the held destination, not a separate racy port-ID lookup. */
++	if ((READ_ONCE(nl_table[ssk->sk_protocol].flags) & NL_CFG_F_ROOT_ONLY) &&
++	    !uid_eq(sock_i_uid(sk), GLOBAL_ROOT_UID)) {
++		kfree_skb(skb);
++		sock_put(sk);
++		return -EPERM;
++	}
+ 	if (sk_filter(sk, skb)) {
+ 		err = skb->len;
+ 		kfree_skb(skb);
+@@ -2019,9 +2034,17 @@ __netlink_kernel_create(struct net *net, int unit, struct module *module,
+ 		goto out_sock_release;
+
+ 	nlk = nlk_sk(sk);
+-	nlk->flags |= NETLINK_F_KERNEL_SOCKET;
+-
+ 	netlink_table_grab();
++	/* A private protocol must neither inherit nor change another
++	 * registrant's access policy.
++	 */
++	if (nl_table[unit].registered &&
++	    ((nl_table[unit].flags | (cfg ? cfg->flags : 0)) &
++	     NL_CFG_F_ROOT_ONLY)) {
++		netlink_table_ungrab();
++		goto out_sock_release;
++	}
++	nlk->flags |= NETLINK_F_KERNEL_SOCKET;
+ 	if (!nl_table[unit].registered) {
+ 		nl_table[unit].groups = groups;
+ 		rcu_assign_pointer(nl_table[unit].listeners, listeners);
