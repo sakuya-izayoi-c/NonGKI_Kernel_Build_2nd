@@ -131,6 +131,10 @@ jobs:
           # 未知 type 因此比 stock 贵；补回 kmemdup 之前的快速拒绝。
           python3 "$GITHUB_WORKSPACE/.github/scripts/patch_ksu_setprocattr_order.py" "$GITHUB_WORKSPACE/device_kernel"
 
+          # sus_path uid filter 首次发布时 old_bitmap 为 NULL，未判空的
+          # kfree_rcu(NULL) 会写内核地址 0，必然卡死重启。
+          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_susfs_uid_filter_null.py" "$GITHUB_WORKSPACE/device_kernel"
+
       - name: 🧰 Patch Kernel of Re:Kernel
         uses: ./.github/workflows/patch-rekernel
         with:
